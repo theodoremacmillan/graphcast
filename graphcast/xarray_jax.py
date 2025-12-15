@@ -95,7 +95,7 @@ If you want to use dynamic data for coordinates, we recommend making it a
 data_var instead of a coord. You won't be able to do indexing and slicing using
 the coordinate, but that wasn't going to work with a jax array anyway.
 """
-
+from __future__ import annotations
 import collections
 import contextlib
 import contextvars
