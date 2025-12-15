@@ -45,6 +45,236 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 import jraph
+from jax import debug as jdebug
+
+import os
+import numpy as np
+import json
+from typing import Optional
+
+import os
+import numpy as np
+from typing import Optional, Sequence
+
+from dataclasses import dataclass
+import jax.lax as jlax
+
+# ---------------------------
+# JAX/Haiku SAE injector
+# ---------------------------
+
+def _topk_jax(x, k):
+  """Top-K per row, zero out the rest. x: [N, L]."""
+  if k is None or k <= 0 or k >= x.shape[-1]:
+    return x
+  # Get topk values & indices
+  vals, idx = jax.lax.top_k(x, k)
+  # Build mask
+  mask = jnp.zeros_like(x)
+  # Scatter the topk positions to 1
+  mask = mask.at[jnp.arange(x.shape[0])[:, None], idx].set(1.0)
+  return x * mask
+
+import haiku as hk
+import jax
+import jax.numpy as jnp
+from typing import Optional
+from dataclasses import dataclass
+
+@dataclass
+class SAEStaticParams:
+    enc_w: jnp.ndarray      # [d_in, latent]
+    dec_w: jnp.ndarray      # [latent, d_in]
+    b_pre: jnp.ndarray      # [d_in]
+    k_active: int
+    unit_norm_decoder: bool
+
+def sae_inject_fn(x: jnp.ndarray,
+                  params: SAEStaticParams,
+                  alpha: Optional[jnp.ndarray] = None) -> jnp.ndarray:
+    """
+    Implements OpenAI-style feature steering:
+    x' = SAE(x, modified code) + (x - SAE(x))
+    So α=0 => x' = x (identity).
+    """
+    x_dtype = x.dtype
+    x = x.astype(jnp.float32)
+
+    # Ensure alpha exists
+    if alpha is None:
+        alpha = jnp.zeros((params.enc_w.shape[1],), dtype=jnp.float32)
+
+    # --- Encode ---
+    z = jnp.dot(x - params.b_pre, params.enc_w)
+
+    # --- Top-K sparsity ---
+    vals, _ = jax.lax.top_k(z, params.k_active)
+    thresh = vals[..., -1, None]
+    z_mask = jnp.where(z >= thresh, z, 0.0)
+
+    # --- Decode baseline reconstruction ---
+    dec_norm = jnp.linalg.norm(params.dec_w, axis=0, keepdims=True)
+    x_recon = jnp.dot(z_mask, params.dec_w / (dec_norm + 1e-8))
+
+    # --- Reconstruction error (kept fixed) ---
+    x_error = x - x_recon
+
+    # --- Modify selected features (scaling/clamping) ---
+    z_mod = z_mask * (1.0 + alpha)
+
+    # --- Decode modified reconstruction ---
+    x_recon_mod = jnp.dot(z_mod, params.dec_w / (dec_norm + 1e-8))
+
+    # --- Final steered activations ---
+    x_prime = x_recon_mod + x_error
+
+    return x_prime.astype(x_dtype)
+
+
+class SAEInjector(hk.Module):
+  """
+  SAE hook that leaves embeddings unchanged by default (recon + error = x),
+  but allows per-feature scaling via alpha to amplify/ablate latent features.
+
+  Forward implements:
+    x_norm = norm_per_row(x) same as your PyTorch SAE (zero-mean, unit-norm)
+    code  = TopK(ReLU((x_norm - b_pre) @ enc_w))
+    recon = code @ (dec_w / ||col||) + b_pre  (if unit_norm_decoder)
+    Base identity: recon + (x_norm - recon) = x_norm (no change)
+    Scaling: y = x_norm + ( (alpha+1) * code - code ) @ dec      (featurewise)
+            = x_norm + (alpha * code) @ dec
+    Finally "unnormalize" by returning to original scale (we map deltas in the
+    normalized space back to the original x by adding them to the original x).
+  """
+  def __init__(self,
+               params: SAEStaticParams,
+               name: str = "SAEInjector"):
+    super().__init__(name=name)
+    self.params = params
+
+  def _normalize_per_row(self, x):
+    xm = x - jnp.mean(x, axis=1, keepdims=True)
+    xn = xm / jnp.linalg.norm(xm, ord=2, axis=1, keepdims=True).clip(min=1e-6)
+    return xn
+
+  def __call__(self,
+               x: jnp.ndarray,
+               alpha: Optional[jnp.ndarray] = None) -> jnp.ndarray:
+    """
+    x: [N, d_in] node embeddings
+    alpha: [latent] feature-scale shift s.t. new_code = (1+alpha)*code.
+           If None or zeros, output equals x (no change).
+           alpha[i] = -1 ablates feature i; alpha[i] = +1 doubles it, etc.
+    """
+    p = self.params
+    # Normalize like PyTorch SAE
+    x_norm = self._normalize_per_row(x)
+    x_bar  = x_norm - p.b_pre  # subtract shared bias before encode
+
+    # Encode (no bias; your PyTorch SAE tied enc = dec^T init)
+    code_pre = jax.nn.relu(x_bar @ p.enc_w)   # [N, L]
+    code     = _topk_jax(code_pre, p.k_active)
+
+    if alpha is None:
+      # Fast path: identity (recon + error = x_norm)
+      # So we just return the original x unchanged.
+      return x
+
+    # Scale selected features
+    # new_code = (1 + alpha) * code   (alpha broadcast over batch)
+    new_code = code * (1.0 + alpha[None, :])
+
+    # Decoder (optionally unit-norm columns)
+    if p.unit_norm_decoder:
+      col_norms = jnp.linalg.norm(p.dec_w, axis=1, keepdims=True).clip(min=1e-8)  # [L,1]
+      dec_eff = p.dec_w / col_norms
+    else:
+      dec_eff = p.dec_w
+
+    # Delta in normalized space: (new_code - code) @ dec
+    delta_norm = (new_code - code) @ dec_eff  # [N, d_in]
+    # Map delta (computed in normalized space around x_norm) back to original x
+    y = x + delta_norm
+    return y
+
+
+class ActivationManager:
+    """
+    Handles selective saving of activations from GraphCast layers.
+    """
+
+    def __init__(self,
+                 enabled: bool = False,
+                 save_dir: Optional[str] = None,
+                 save_steps: Optional[Sequence[int]] = None,
+                 save_node_sets: Optional[Sequence[str]] = None,
+                 mode: str = "post_res"):
+        self.enabled = enabled
+        self.save_dir = save_dir
+        self.save_steps = save_steps
+        self.save_node_sets = save_node_sets
+        self.mode = mode
+        self.current_time_str: Optional[str] = None   # <--- NEW
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+
+    # --- add these small helpers ---
+    def set_time(self, time_str: Optional[str]):
+        """Set a global time string (e.g. '2021-09-28T06Z') for subsequent saves."""
+        self.current_time_str = time_str
+
+    def clear_time(self):
+        """Unset the current global time label."""
+        self.current_time_str = None
+
+    def _should_save(self, tag: str, step_idx: Optional[int], node_set: str) -> bool:
+        """Determine if this activation should be saved."""
+        if not self.enabled:
+            return False
+        if self.mode not in tag and self.mode != "both":
+            return False
+        if self.save_steps is not None and step_idx not in self.save_steps:
+            return False
+        if self.save_node_sets is not None and node_set not in self.save_node_sets:
+            return False
+        return True
+
+    def save(self, tag: str, x, *,
+             step_idx: Optional[int] = None,
+             node_set: Optional[str] = None,
+             time_str: Optional[str] = None):
+        """Save activation array x for given step / node set."""
+        if not self._should_save(tag, step_idx, node_set):
+            return
+
+        # Prefer explicit time_str if provided, else use the global one
+        ts = time_str or self.current_time_str
+        arr = np.asarray(x).copy()
+
+        safe_tag = tag.replace("/", "_")
+        step_prefix = f"layer{step_idx:04d}_" if step_idx is not None else ""
+        time_suffix = f"_t{ts}" if ts else ""
+        node_suffix = f"_{node_set}" if node_set else ""
+
+        fname = f"{step_prefix}{safe_tag}{time_suffix}.npy"
+        np.save(os.path.join(self.save_dir, fname), arr)
+
+    def get_cache(self):
+        """Return in-memory cache (if using memory mode)."""
+        return self._cache if self._cache is not None else {}
+
+    def clear(self):
+        """Clear in-memory cache."""
+        if self._cache is not None:
+            self._cache.clear()
+
+
+# Global instance (imported across modules)
+_ACT_MANAGER = ActivationManager()
+
+def get_activation_manager():
+    """Return global ActivationManager instance."""
+    return _ACT_MANAGER
 
 
 GraphToGraphNetwork = Callable[[typed_graph.TypedGraph], typed_graph.TypedGraph]
@@ -98,6 +328,11 @@ class DeepTypedGraphNet(hk.Module):
                f32_aggregation: bool = False,
                aggregate_edges_for_nodes_fn: str = "segment_sum",
                aggregate_normalization: Optional[float] = None,
+               # --- NEW SAE hook config ---
+               sae_injector: Optional[SAEInjector] = None,
+               sae_target_steps: Optional[Sequence[int]] = None,
+               sae_target_node_sets: Optional[Sequence[str]] = None,
+               sae_alpha: Optional[jnp.ndarray] = None,
                name: str = "DeepTypedGraphNet"):
     """Inits the model.
 
@@ -172,6 +407,12 @@ class DeepTypedGraphNet(hk.Module):
     self._aggregate_edges_for_nodes_fn = _get_aggregate_edges_for_nodes_fn(
         aggregate_edges_for_nodes_fn)
     self._aggregate_normalization = aggregate_normalization
+
+    # Initialize SAE hook
+    self._sae_injector = sae_injector
+    self._sae_target_steps = set(sae_target_steps or [])
+    self._sae_target_node_sets = set(sae_target_node_sets or [])
+    self._sae_alpha = sae_alpha  # jnp.ndarray [latent] or None
 
     if aggregate_normalization:
       # using aggregate_normalization only makes sense with segment_sum.
@@ -364,15 +605,18 @@ class DeepTypedGraphNet(hk.Module):
     # with unshared weights, and repeat that `self._num_processor_repetitions`
     # times.
     latent_graph = latent_graph_0
+    step_counter = 0
     for unused_repetition_i in range(self._num_processor_repetitions):
       for processor_network in processor_networks:
-        latent_graph = self._process_step(processor_network, latent_graph)
+        latent_graph = self._process_step(processor_network, latent_graph, step_idx=step_counter)
+        step_counter += 1
 
     return latent_graph
 
   def _process_step(
       self, processor_network_k,
-      latent_graph_prev_k: typed_graph.TypedGraph) -> typed_graph.TypedGraph:
+      latent_graph_prev_k: typed_graph.TypedGraph,
+      step_idx: int) -> typed_graph.TypedGraph:
     """Single step of message passing with node/edge residual connections."""
 
     # One step of message passing.
@@ -391,6 +635,35 @@ class DeepTypedGraphNet(hk.Module):
 
     latent_graph_k = latent_graph_k._replace(
         nodes=nodes_with_residuals, edges=edges_with_residuals)
+
+    # ---------------------------
+    # 🔌 SAE INJECTION (optional)
+    # ---------------------------
+    if (self._sae_injector is not None) and (step_idx in self._sae_target_steps):
+      new_nodes = {}
+      for nset, ns in latent_graph_k.nodes.items():
+        if (not self._sae_target_node_sets) or (nset in self._sae_target_node_sets):
+          # ns.features: [N_nodes, d_in]
+          new_feats = self._sae_injector(ns.features, alpha=self._sae_alpha)
+          new_nodes[nset] = ns._replace(features=new_feats)
+        else:
+          new_nodes[nset] = ns
+      latent_graph_k = latent_graph_k._replace(nodes=new_nodes)
+
+    am = get_activation_manager()
+    if am.enabled:
+        for nset, ns in latent_graph_k.nodes.items():
+            tag = f"{self.name}/post_res/nodes/{nset}"
+            jdebug.callback(
+                lambda x, t=tag, s=step_idx, n=nset: am.save(
+                    t, x, step_idx=s, node_set=n
+                ),
+                ns.features,
+                ordered=True,
+            )
+
+    jax.block_until_ready(latent_graph_k)
+
     return latent_graph_k
 
   def _output(

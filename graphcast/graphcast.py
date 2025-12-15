@@ -240,7 +240,12 @@ class GraphCast(predictor_base.Predictor):
 
   """
 
-  def __init__(self, model_config: ModelConfig, task_config: TaskConfig):
+  def __init__(self, model_config: ModelConfig, task_config: TaskConfig, *,
+        mesh_sae_injector=None,
+        mesh_sae_steps=None,
+        mesh_sae_node_sets=None,
+        mesh_sae_alpha=None
+    ):
     """Initializes the predictor."""
     self._spatial_features_kwargs = dict(
         add_node_positions=False,
@@ -276,6 +281,8 @@ class GraphCast(predictor_base.Predictor):
         name="grid2mesh_gnn",
     )
 
+    
+
     # Processor, which performs message passing on the multi-mesh.
     self._mesh_gnn = deep_typed_graph_net.DeepTypedGraphNet(
         embed_nodes=False,  # Node features already embdded by previous layers.
@@ -290,6 +297,11 @@ class GraphCast(predictor_base.Predictor):
         activation="swish",
         f32_aggregation=False,
         name="mesh_gnn",
+        # SAE hook (optional)
+        sae_injector=mesh_sae_injector,
+        sae_target_steps=mesh_sae_steps,
+        sae_target_node_sets=mesh_sae_node_sets,
+        sae_alpha=mesh_sae_alpha,
     )
 
     num_surface_vars = len(
